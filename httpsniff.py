@@ -3,12 +3,17 @@
 
 import pcap
 import sys
+import os
+import re
 import string
 import time
 import socket
 import struct
+import zlib
+import gzip
 from termcolor import cprint
 from cStringIO import StringIO
+from mimetools import Message
 
 protocols={socket.IPPROTO_TCP:'tcp',
            socket.IPPROTO_UDP:'udp',
@@ -78,6 +83,114 @@ def seen_opposite_flow(packet):
     return k in seen_flows
 
 
+# got from gzip module
+def read_gzip_header(fileobj):
+    magic = fileobj.read(2)
+    if magic != '\037\213':
+        raise IOError('Not a gzipped file')
+    method = ord(fileobj.read(1))
+    if method != 8:
+        raise IOError('Unknown compression method')
+    flag = ord(fileobj.read(1))
+    # modtime = fileobj.read(4)
+    # extraflag = fileobj.read(1)
+    # os = fileobj.read(1)
+    fileobj.read(6)
+
+    if flag & gzip.FEXTRA:
+        # Read & discard the extra field, if present
+        xlen = ord(fileobj.read(1))
+        xlen = xlen + 256 * ord(fileobj.read(1))
+        fileobj.read(xlen)
+    if flag & gzip.FNAME:
+        # Read and discard a null-terminated string containing the filename
+        while True:
+            s = fileobj.read(1)
+            if not s or s == '\000':
+                break
+    if flag & gzip.FCOMMENT:
+        # Read and discard a null-terminated string containing a comment
+        while True:
+            s = fileobj.read(1)
+            if not s or s == '\000':
+                break
+    if flag & gzip.FHCRC:
+        fileobj.read(2)     # Read & discard the 16-bit header CRC
+
+
+
+def read_body_chunked(fp):
+    o = StringIO()
+    while True:
+        line = fp.readline()
+        if not line:
+            print >> sys.stderr, "short read in chunked encoding"
+            break
+
+        chunk_size = int(line, 16)  # this would include the CRLF
+        if not chunk_size:
+            # read all
+            o.write(fp.read())
+            break
+        else:
+            o.write(fp.read()[:chunk_size])
+            fp.read(2)  # CRLF
+
+    return o.getvalue()
+
+
+def read_body(fp, chunked):
+    if chunked:
+        return read_body_chunked(fp)
+
+    return fp.read()
+
+    
+
+RE_CHARSET=re.compile(r';\s*charset\s*=\s*([\w_\.\-]+)', re.I)
+
+def format_body(message, body_fp):
+    """ return (is_compressed, body) """
+
+    t_enc = message.get('Transfer-Encoding', '').strip().lower()
+    c_enc = message.get('Content-Encoding', '').strip().lower()
+    c_type = message.get('Content-Type', '').strip().lower()
+    charset = 'latin1'
+    m = RE_CHARSET.search(c_type)
+    if m:
+        charset = m.group(1)
+
+    body = read_body(body_fp, t_enc == 'chunked')
+    if c_enc in ('gzip', 'x-gzip', 'deflate'):
+        try:
+            if c_enc != 'deflate':
+                buf = StringIO(body)
+                read_gzip_header(buf)
+                body = buf.read()
+                do = zlib.decompressobj(-zlib.MAX_WBITS)
+            else:
+                do = zlib.decompressobj()
+            decompressed = do.decompress(body)
+            #print "<gzipped>\n" + decompressed
+            return (True, decompressed)
+        except:
+            import traceback
+            traceback.print_exc()
+    else:
+        return (False, body)
+
+
+def print_http_message(s, color):
+    req_or_res, headers_and_body = s.split('\r\n', 1)
+    fp_headers_and_body = StringIO(headers_and_body)
+    m = Message(fp_headers_and_body)
+    headers_part = fp_headers_and_body.getvalue(True)
+    compressed, out = format_body(m, fp_headers_and_body)
+    cprint(req_or_res, color, attrs=['dark'])
+    cprint(headers_part, color, attrs=['bold'])
+    cprint(out, color)
+
+
 def print_packet(pktlen, data, timestamp):
     if not data:
         return
@@ -88,7 +201,7 @@ def print_packet(pktlen, data, timestamp):
         if DUMP_ONLY_FIRST_IN_EACH_DIR and not is_seen_flow(decoded):
             should_output = True
 
-        print '\n%s.%f %s:%d > %s:%d' % (time.strftime('%H:%M',
+        print '\n%s.%f %s:%d > %s:%d\n' % (time.strftime('%H:%M',
                                                  time.localtime(timestamp)),
                                    timestamp % 60,
                                    decoded['source_address'],
@@ -102,7 +215,8 @@ def print_packet(pktlen, data, timestamp):
         #print '  header checksum: %d' % decoded['checksum']
         if should_output:
             if 'payload' in decoded:
-                cprint(decoded['payload'][:SNIP_DATA], 'blue' if seen_opposite_flow(decoded) else 'yellow')
+                print_http_message(decoded['payload'][:SNIP_DATA],
+                                   'blue' if seen_opposite_flow(decoded) else 'yellow')
                 mark_seen_flow(decoded)
 
             #try_dump_pretty(decoded['data'])
@@ -118,8 +232,9 @@ if __name__=='__main__':
   #dev = pcap.lookupdev()
   dev = sys.argv[1]
   net, mask = pcap.lookupnet(dev)
+  # open_live(dev, snaplen, promisc, to_ms)
   # note:  to_ms does nothing on linux
-  p.open_live(dev, 1600, 0, 100)
+  p.open_live(dev, SNIP_DATA+300, 0, 100)
   #p.dump_open('dumpfile')
   p.setfilter(string.join(sys.argv[2:],' '), 0, 0)
 
